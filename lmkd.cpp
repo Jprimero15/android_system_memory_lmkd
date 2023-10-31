@@ -98,12 +98,12 @@ static inline void trace_kill_end() {}
 #define TRACE_MARKER_PATH "/sys/kernel/tracing/trace_marker"
 #define PROC_STATUS_RSS_FIELD "VmRSS:"
 #define PROC_STATUS_SWAP_FIELD "VmSwap:"
-#define LINE_MAX 128
 #define MAX_NR_ZONES 6
 
 #define PERCEPTIBLE_APP_ADJ 200
 #define VISIBLE_APP_ADJ 100
 #define PERCEPTIBLE_RECENT_FOREGROUND_APP_ADJ 50
+#define PREVIOUS_APP_ADJ 700
 
 /* Android Logger event logtags (see event.logtags) */
 #define KILLINFO_LOG_TAG 10195355
@@ -1314,7 +1314,7 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
     bool is_system_server;
     struct passwd *pwdrec;
     int64_t tgid;
-    static char buf[PAGE_SIZE];
+    char buf[PAGE_SIZE];
 
     lmkd_pack_get_procprio(packet, field_count, &params);
 
@@ -2967,7 +2967,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int64_t tgid;
     int64_t rss_kb;
     int64_t swap_kb;
-    static char buf[PAGE_SIZE];
+    char buf[PAGE_SIZE];
     char desc[LINE_MAX];
 
     if (!procp->valid || !read_proc_status(pid, buf, sizeof(buf))) {
@@ -3843,6 +3843,15 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         kill_reason = COMPACTION;
         strlcpy(kill_desc, "device is in compaction and low on memory", sizeof(kill_desc));
         min_score_adj = VISIBLE_APP_ADJ;
+    }
+
+    /* Check if a cached app should be killed */
+    if (kill_reason == NONE && wmark < WMARK_HIGH) {
+        /* TODO: introduce a new kill reason */
+        kill_reason = LOW_MEM_AND_SWAP;
+        snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached",
+            wmark < WMARK_LOW ? "min" : "low");
+        min_score_adj = PREVIOUS_APP_ADJ + 1;
     }
 
     /* Kill a process if necessary */
@@ -5309,7 +5318,7 @@ static bool update_props() {
     thrashing_limit_decay_pct = clamp(0, 100, GET_LMK_PROPERTY(int32, "thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
     thrashing_critical_pct = std::max(
-            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", thrashing_limit_pct * 2));
+            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", thrashing_limit_pct * 3));
     swap_util_max = clamp(0, 100, GET_LMK_PROPERTY(int32, "swap_util_max", 100));
     filecache_min_kb = GET_LMK_PROPERTY(int64, "filecache_min_kb", 0);
     stall_limit_critical = GET_LMK_PROPERTY(int64, "stall_limit_critical", 100);
