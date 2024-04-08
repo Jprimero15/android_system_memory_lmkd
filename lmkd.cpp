@@ -40,8 +40,12 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <shared_mutex>
+#include <vector>
 
+#include <bpf/KernelUtils.h>
+#include <bpf/WaitForProgsLoaded.h>
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
 #include <liblmkd_utils.h>
@@ -50,6 +54,7 @@
 #include <log/log.h>
 #include <log/log_event_list.h>
 #include <log/log_time.h>
+#include <memevents/memevents.h>
 #include <private/android_filesystem_config.h>
 #include <processgroup/processgroup.h>
 #include <psi/psi.h>
@@ -212,6 +217,10 @@ struct psi_threshold {
     int threshold_ms;
 };
 
+/* Listener for direct reclaim state changes */
+static std::unique_ptr<android::bpf::memevents::MemEventListener> memevent_listener(nullptr);
+static struct timespec direct_reclaim_start_tm;
+
 static int level_oomadj[VMPRESS_LEVEL_COUNT];
 static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1, -1 };
 static bool pidfd_supported;
@@ -324,8 +333,9 @@ static struct event_handler_info vmpressure_hinfo[VMPRESS_LEVEL_COUNT];
 /*
  * 1 ctrl listen socket, 3 ctrl data socket, 3 memory pressure levels,
  * 1 lmk events + 1 fd to wait for process death + 1 fd to receive kill failure notifications
+ * + 1 fd to receive direct reclaim state change notifications
  */
-#define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1)
+#define MAX_EPOLL_EVENTS (1 + MAX_DATA_CONN + VMPRESS_LEVEL_COUNT + 1 + 1 + 1 + 1)
 static int epollfd;
 static int maxevents;
 
@@ -667,7 +677,7 @@ static bool s_crit_event_upgraded = false;
  * Initialize this as we decide the window size based on ram size for
  * lowram targets on old strategy.
  */
-static long page_k = PAGE_SIZE / 1024;
+static long page_k = -1;
 
 static void init_PreferredApps();
 static void update_perf_props();
@@ -750,7 +760,7 @@ static ssize_t read_all(int fd, char *buf, size_t max_len)
  */
 static char *reread_file(struct reread_data *data) {
     /* start with page-size buffer and increase if needed */
-    static ssize_t buf_size = PAGE_SIZE;
+    static ssize_t buf_size = getpagesize();
     static char *new_buf, *buf = NULL;
     ssize_t size;
 
@@ -971,7 +981,7 @@ static void poll_kernel(int poll_fd) {
         if (fields_read == 10 && group_leader_pid == pid) {
             ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid);
             mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
-            mem_st.rss_in_bytes = rss_in_pages * PAGE_SIZE;
+            mem_st.rss_in_bytes = rss_in_pages * getpagesize();
 
             struct kill_stat kill_st = {
                 .uid = static_cast<int32_t>(uid),
@@ -1212,7 +1222,7 @@ static bool parse_vmswap(char *buf, long *data) {
 }
 
 static long proc_get_swap(int pid) {
-    static char buf[PAGE_SIZE] = {0, };
+    static char buf[BUF_MAX] = {0, };
     static char path[PATH_MAX] = {0, };
     ssize_t ret;
     char *c, *save_ptr;
@@ -1315,7 +1325,7 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
     bool is_system_server;
     struct passwd *pwdrec;
     int64_t tgid;
-    char buf[PAGE_SIZE];
+    char buf[BUF_MAX];
 
     lmkd_pack_get_procprio(packet, field_count, &params);
 
@@ -2413,7 +2423,7 @@ static int parse_one_zone_watermark(char *buf, struct watermark_info *w)
 
 static void trace_log(const char *fmt, ...)
 {
-    char buf[PAGE_SIZE];
+    char buf[BUF_MAX];
     va_list ap;
     static int fd = -1;
     ssize_t len, ret;
@@ -2968,7 +2978,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int64_t tgid;
     int64_t rss_kb;
     int64_t swap_kb;
-    char buf[PAGE_SIZE];
+    char buf[BUF_MAX];
     char desc[LINE_MAX];
 
     if (!procp->valid || !read_proc_status(pid, buf, sizeof(buf))) {
@@ -3500,6 +3510,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
        (!poll_params->poll_handler || data >= poll_params->poll_handler->data)) {
            wbf_effective = wmark_boost_factor;
     }
+    bool in_direct_reclaim;
 
     if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
         ALOGE("Failed to get current time");
@@ -3599,8 +3610,12 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         in_compaction = true;
     }
 
+    in_direct_reclaim = memevent_listener ? (direct_reclaim_start_tm.tv_sec != 0 ||
+                                             direct_reclaim_start_tm.tv_nsec != 0)
+                                          : (vs.field.pgscan_direct != init_pgscan_direct);
+
     /* Identify reclaim state */
-    if (vs.field.pgscan_direct != init_pgscan_direct) {
+    if (in_direct_reclaim) {
         init_pgscan_direct = vs.field.pgscan_direct;
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
         init_pgrefill = vs.field.pgrefill;
@@ -4370,6 +4385,103 @@ static MemcgVersion memcg_version() {
     return version;
 }
 
+static void direct_reclaim_state_change(int data __unused, uint32_t events __unused,
+                                        struct polling_params* poll_params __unused) {
+    struct timespec curr_tm;
+    std::vector<mem_event_t> mem_events;
+
+    if (clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm) != 0) {
+        direct_reclaim_start_tm.tv_sec = 0;
+        direct_reclaim_start_tm.tv_nsec = 0;
+        ALOGE("Failed to get current time for direct reclaim state change.");
+        return;
+    }
+
+    if (!memevent_listener->getMemEvents(mem_events)) {
+        direct_reclaim_start_tm.tv_sec = 0;
+        direct_reclaim_start_tm.tv_nsec = 0;
+        ALOGE("Failed fetching direct reclaim events.");
+        return;
+    }
+
+    /*
+     * `mem_events` is ordered from oldest to newest, therefore we use
+     * the last/latest direct reclaim event as the current direct reclaim
+     * state.
+     */
+    for (const mem_event_t mem_event : mem_events) {
+        if (mem_event.type == MEM_EVENT_DIRECT_RECLAIM_BEGIN) {
+            direct_reclaim_start_tm = curr_tm;
+        } else if (mem_event.type == MEM_EVENT_DIRECT_RECLAIM_END) {
+            direct_reclaim_start_tm.tv_sec = 0;
+            direct_reclaim_start_tm.tv_nsec = 0;
+        }
+    }
+}
+
+static bool init_direct_reclaim_monitoring() {
+    static struct event_handler_info direct_reclaim_poll_hinfo = {0, direct_reclaim_state_change};
+
+    if (!memevent_listener) {
+        // Make sure bpf programs are loaded
+        android::bpf::waitForProgsLoaded();
+        memevent_listener = std::make_unique<android::bpf::memevents::MemEventListener>(
+                android::bpf::memevents::MemEventClient::LMKD);
+    }
+
+    if (!memevent_listener->ok()) {
+        ALOGE("Failed to initialize memevents listener");
+        memevent_listener.reset();
+        return false;
+    }
+
+    if (!memevent_listener->registerEvent(MEM_EVENT_DIRECT_RECLAIM_BEGIN) ||
+        !memevent_listener->registerEvent(MEM_EVENT_DIRECT_RECLAIM_END)) {
+        ALOGE("Failed to register direct reclaim memevents");
+        memevent_listener.reset();
+        return false;
+    }
+
+    int memevent_listener_fd = memevent_listener->getRingBufferFd();
+    if (memevent_listener_fd < 0) {
+        memevent_listener.reset();
+        ALOGE("Invalid memevent_listener fd: %d", memevent_listener_fd);
+        return false;
+    }
+
+    struct epoll_event epev;
+    epev.events = EPOLLIN;
+    epev.data.ptr = (void*)&direct_reclaim_poll_hinfo;
+    if (epoll_ctl(epollfd, EPOLL_CTL_ADD, memevent_listener_fd, &epev) < 0) {
+        ALOGE("Failed registering direct reclaim fd: %d; errno=%d", memevent_listener_fd, errno);
+        /*
+         * Reset the fd to let `destroy_direct_reclaim_monitoring` know we failed adding this fd,
+         * therefore it won't try to close the `memevent_listener_fd`.
+         */
+        memevent_listener.reset();
+        return false;
+    }
+
+    direct_reclaim_start_tm.tv_sec = 0;
+    direct_reclaim_start_tm.tv_nsec = 0;
+
+    maxevents++;
+    return true;
+}
+
+static void destroy_direct_reclaim_monitoring() {
+    if (!memevent_listener) return;
+
+    if (epoll_ctl(epollfd, EPOLL_CTL_DEL, memevent_listener->getRingBufferFd(), NULL) < 0) {
+        ALOGE("Failed to unregister direct reclaim monitoring; errno=%d", errno);
+    }
+
+    maxevents--;
+    memevent_listener.reset();
+    direct_reclaim_start_tm.tv_sec = 0;
+    direct_reclaim_start_tm.tv_nsec = 0;
+}
+
 static bool init_psi_monitors() {
     /*
      * When PSI is used on low-ram devices or on high-end devices without memfree levels
@@ -4534,6 +4646,13 @@ static bool init_monitors() {
     } else {
         ALOGI("Using vmpressure for memory pressure detection");
     }
+
+    if (init_direct_reclaim_monitoring()) {
+        ALOGI("Using memevents for direct reclaim detection");
+    } else {
+        ALOGI("Using vmstats for direct reclaim detection");
+    }
+
     monitors_initialized = true;
     return true;
 }
@@ -4549,6 +4668,7 @@ static void destroy_monitors() {
         destroy_mp_common(VMPRESS_LEVEL_MEDIUM);
         destroy_mp_common(VMPRESS_LEVEL_LOW);
     }
+    destroy_direct_reclaim_monitoring();
 }
 
 static void update_psi_window_size() {
@@ -4559,7 +4679,7 @@ static void update_psi_window_size() {
             /*
              * Set the optimal settings for lowram targets.
              */
-            if (info.field.nr_total_pages < (int64_t)(SZ_4G / PAGE_SIZE)) {
+            if (info.field.nr_total_pages < (int64_t)(SZ_4G / getpagesize())) {
                 if (psi_window_size_ms > 500) {
                     psi_window_size_ms = 500;
                     ULMK_LOG(I, "PSI window size is changed to %dms\n", psi_window_size_ms);
@@ -4651,7 +4771,7 @@ static int init(void) {
 
     page_k = sysconf(_SC_PAGESIZE);
     if (page_k == -1)
-        page_k = PAGE_SIZE;
+        page_k = getpagesize();
     page_k /= 1024;
 
     update_psi_window_size();
