@@ -173,6 +173,8 @@ static inline void trace_kill_end() {}
 #define DEF_PARTIAL_STALL 70
 /* ro.lmk.psi_complete_stall_ms property defaults */
 #define DEF_COMPLETE_STALL 700
+/* ro.lmk.psi_scrit_complete_stall_ms property defaults */
+#define DEF_COMPLETE_STALL_SCRIT 800
 /* ro.lmk.direct_reclaim_threshold_ms property defaults */
 #define DEF_DIRECT_RECL_THRESH_MS 0
 /* ro.lmk.swap_compression_ratio property defaults */
@@ -245,6 +247,7 @@ static bool enable_userspace_lmk;
 static int swap_free_low_percentage;
 static int psi_partial_stall_ms;
 static int psi_complete_stall_ms;
+static int psi_complete_stall_scrit_ms;
 static int thrashing_limit_pct;
 static int thrashing_limit_decay_pct;
 static int thrashing_critical_pct;
@@ -4028,6 +4031,7 @@ static bool init_psi_monitors() {
     psi_thresholds[VMPRESS_LEVEL_LOW].threshold_ms = 0;
     psi_thresholds[VMPRESS_LEVEL_MEDIUM].threshold_ms = psi_partial_stall_ms;
     psi_thresholds[VMPRESS_LEVEL_CRITICAL].threshold_ms = psi_complete_stall_ms;
+    psi_thresholds[VMPRESS_LEVEL_SUPER_CRITICAL].threshold_ms = psi_complete_stall_scrit_ms;
 
     if (!init_mp_psi(VMPRESS_LEVEL_LOW)) {
         return false;
@@ -4728,10 +4732,10 @@ static void update_perf_props() {
             PROPERTY_VALUE_MAX);
         psi_window_size_ms = strtod(property, NULL);
 
-        snprintf(default_value, PROPERTY_VALUE_MAX, "%d", psi_thresholds[VMPRESS_LEVEL_SUPER_CRITICAL]);
+        snprintf(default_value, PROPERTY_VALUE_MAX, "%d", DEF_COMPLETE_STALL_SCRIT);
         strlcpy(property, perf_get_prop("ro.lmk.psi_scrit_complete_stall_ms", default_value).value,
             PROPERTY_VALUE_MAX);
-        psi_thresholds[VMPRESS_LEVEL_SUPER_CRITICAL].threshold_ms = strtod(property, NULL);
+        psi_complete_stall_scrit_ms = strtod(property, NULL);
 
         snprintf(default_value, PROPERTY_VALUE_MAX, "%d", PSI_POLL_PERIOD_SHORT_MS);
         strlcpy(property, perf_get_prop("ro.lmk.psi_poll_period_scrit_ms", default_value).value,
