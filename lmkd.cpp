@@ -3045,16 +3045,6 @@ void record_low_pressure_levels(union meminfo *mi) {
     }
 }
 
-enum vmpressure_level upgrade_level(enum vmpressure_level level) {
-    return (enum vmpressure_level)((level < VMPRESS_LEVEL_CRITICAL) ?
-        level + 1 : level);
-}
-
-enum vmpressure_level downgrade_level(enum vmpressure_level level) {
-    return (enum vmpressure_level)((level > VMPRESS_LEVEL_LOW) ?
-        level - 1 : level);
-}
-
 enum zone_watermark {
     WMARK_MIN = 0,
     WMARK_LOW,
@@ -4028,27 +4018,20 @@ static bool init_memevent_listener_monitoring() {
 
 static bool init_psi_monitors() {
     /* In default PSI mode override stall amounts using system properties */
-    psi_thresholds[VMPRESS_LEVEL_LOW].threshold_ms = 0;
     psi_thresholds[VMPRESS_LEVEL_MEDIUM].threshold_ms = psi_partial_stall_ms;
     psi_thresholds[VMPRESS_LEVEL_CRITICAL].threshold_ms = psi_complete_stall_ms;
     psi_thresholds[VMPRESS_LEVEL_SUPER_CRITICAL].threshold_ms = psi_complete_stall_scrit_ms;
 
-    if (!init_mp_psi(VMPRESS_LEVEL_LOW)) {
-        return false;
-    }
     if (!init_mp_psi(VMPRESS_LEVEL_MEDIUM)) {
-        destroy_mp_psi(VMPRESS_LEVEL_LOW);
         return false;
     }
     if (!init_mp_psi(VMPRESS_LEVEL_CRITICAL)) {
         destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
-        destroy_mp_psi(VMPRESS_LEVEL_LOW);
         return false;
     }
     if (!init_mp_psi(VMPRESS_LEVEL_SUPER_CRITICAL)) {
         destroy_mp_psi(VMPRESS_LEVEL_CRITICAL);
         destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
-        destroy_mp_psi(VMPRESS_LEVEL_LOW);
         return false;
     }
     return true;
@@ -4177,7 +4160,6 @@ static void destroy_monitors() {
         destroy_mp_psi(VMPRESS_LEVEL_SUPER_CRITICAL);
         destroy_mp_psi(VMPRESS_LEVEL_CRITICAL);
         destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
-        destroy_mp_psi(VMPRESS_LEVEL_LOW);
     } else {
         destroy_mp_common(VMPRESS_LEVEL_CRITICAL);
         destroy_mp_common(VMPRESS_LEVEL_MEDIUM);
